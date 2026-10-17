@@ -23,20 +23,59 @@
 #define REPORT_ID_OUT    0x01
 #define REPORT_ID_IN     0x02
 
+#define TX_TIMEOUT      3000
+#define RX_TIMEOUT      3000
+
+
+
+typedef enum{
+    ERROR_NONE = 0,
+    ERROR_CURRENT_DRIVER_NOT_CONNECTED,
+    ERROR_CURRENT_DRIVER_INVALID_PARAMETER,
+    ERROR_CURRENT_DRIVER_TRANSFER_FAILED
+} error_codes_t;
+
 typedef enum {
-    CMD_HELP = 0,
-    CMD_CONNECT_DEVICE,
-    CMD_DEFAULT_DEVICE,
+    CMD_NONE= 0,
     CMD_DEBUG,
     CMD_EXIT_DEBUG,
     CMD_SET_CURRENT,
-    CMD_GET_CURRENT,
     CMD_GET_PARAMETERS,
-    CMD_GET_GRAPH,
 	CMD_SET_TIME_MEASURING,
-    CMD_SET_VOLTAGE_CORRECTION,
-    CMD_EXIT
+	CMD_SET_CONTROL_MODE,
+	CMD_RETRY,
+    CMD_INIT,
+    CMD_END_INIT
+} MCU_commands;
+
+typedef enum {
+    CMD_HELP_CONSOLE = 0,
+    CMD_CONNECT_DEVICE_CONSOLE,
+    CMD_DEFAULT_DEVICE_CONSOLE,
+    CMD_DEBUG_CONSOLE,
+    CMD_EXIT_DEBUG_CONSOLE,
+    CMD_SET_CURRENT_CONSOLE,
+    CMD_GET_CURRENT_CONSOLE,
+    CMD_GET_PARAMETERS_CONSOLE,
+    CMD_GET_GRAPH_CONSOLE,
+	CMD_SET_TIME_MEASURING_CONSOLE,
+	CMD_SET_CONTROL_MODE_CONSOLE,
+	CMD_RETRY_CONSOLE,
+    CMD_INIT_CONSOLE,
+    CMD_END_INIT_CONSOLE,
+    CMD_NONE_CONSOLE,
+    CMD_EXIT_CONSOLE
 } commands;
+
+
+
+
+typedef enum CurrentSourceRegulationMode_t{
+	NOT_DEFINED = 0,
+	SIMPLE,
+	PI,
+	PID
+} CurrentSourceRegulationMode_t;
 
 typedef struct i_src_param{
     int32_t adc_raw;
@@ -47,19 +86,34 @@ typedef struct i_src_param{
     uint32_t i_lim;
     uint32_t i;
     uint32_t Vdac;
+    uint32_t measuring_time;
+    CurrentSourceRegulationMode_t mode;
 } i_src_param;
-
 
 //Global param
 i_src_param* graph_param = NULL;
-unsigned char tx_buffer[REPORT_SIZE];
-unsigned char rx_buffer[REPORT_SIZE];
 
 int width_begin = 10;
 int width_end = 15;
 unsigned int tmp; // Изменено на unsigned int
 
 /*-----------------------------------------------------------------------Functions---------------------------------------------------------*/
+
+void help() {
+        printf("%*s\n", width_begin, "Available commands:");
+        printf("%*d - Help\n", width_end, CMD_HELP_CONSOLE);
+        printf("%*d - Connect device\n", width_end, CMD_CONNECT_DEVICE_CONSOLE);
+        printf("%*d - Connect default device\n", width_end, CMD_DEFAULT_DEVICE_CONSOLE);
+        printf("%*d - Debug mode\n", width_end, CMD_DEBUG_CONSOLE);
+        printf("%*d - Exit debug mode\n", width_end, CMD_EXIT_DEBUG_CONSOLE);
+        printf("%*d - Get current\n", width_end, CMD_GET_CURRENT_CONSOLE);
+        printf("%*d - Set current\n", width_end, CMD_SET_CURRENT_CONSOLE);
+        printf("%*d - Get parameters\n", width_end, CMD_GET_PARAMETERS_CONSOLE);
+        printf("%*d - Get graph\n", width_end, CMD_GET_GRAPH_CONSOLE);
+        printf("%*d - Set measuring time\n", width_end, CMD_SET_TIME_MEASURING_CONSOLE);
+        printf("%*d - Init current_source\n", width_end, CMD_INIT_CONSOLE);
+        printf("%*d - Exit program\n", width_end, CMD_EXIT_CONSOLE);
+}
 
 void write_uint32_to_buff(uint8_t* p_src, uint32_t value) {
     // Безопасно для Cortex-M0/M3/M4, не нарушает MISRA C
@@ -80,44 +134,54 @@ void print_data(i_src_param* param) {
     printf("Current Limit: %u\n", param->i_lim);
     printf("Current setted: %u\n", param->i);
     printf("Vdac: %u\n", param->Vdac);
+    printf("Measuring Time: %u\n", param->measuring_time);
 }
 
-i_src_param* get_param(i_src_param* param, libusb_device_handle **USB_Device) {
-            int result;
-            int transferred = 0;
+
+error_codes_t transmit_data(unsigned char* tx_buff, unsigned char* rx_buff, MCU_commands cmd, libusb_device_handle **USB_Device){
             if (!(*USB_Device)) {
                 fprintf(stderr, "Error: No device connected. Connect a device first.\n");
-                return NULL;
+                return ERROR_CURRENT_DRIVER_NOT_CONNECTED;
             }
-
-            memset(rx_buffer, 0, REPORT_SIZE);
-            transferred = 0;
-
-            memset(tx_buffer, 0, REPORT_SIZE);
-            tx_buffer[0] = REPORT_ID_OUT; 
-            tx_buffer[1] = CMD_GET_PARAMETERS; 
-
-
-            printf("Getting parameters...\n");
-            result = libusb_interrupt_transfer(*USB_Device, EP_OUT, tx_buffer, REPORT_SIZE, &transferred, 1000);
-            
+            int result;
+            int transferred = 0;
+            tx_buff[0] = REPORT_ID_OUT; 
+            tx_buff[1] = cmd; 
+            result = libusb_interrupt_transfer(*USB_Device, EP_OUT, tx_buff, REPORT_SIZE, &transferred, TX_TIMEOUT);
             if (result < 0) {
                 fprintf(stderr, "Error: Data transmission failed (%d)\n", result);
-                return NULL;
+                return ERROR_CURRENT_DRIVER_TRANSFER_FAILED;
             } else {
                 printf("Sent %d bytes successfully.\n", transferred);
             }
 
-            result = libusb_interrupt_transfer(*USB_Device, EP_IN, rx_buffer, REPORT_SIZE, &transferred, 3000);
-            
+            result = libusb_interrupt_transfer(*USB_Device, EP_IN, rx_buff, REPORT_SIZE, &transferred, RX_TIMEOUT);
             if (result < 0) {
                 fprintf(stderr, "Error: Data reception failed (%d)\n", result);
+                return ERROR_CURRENT_DRIVER_TRANSFER_FAILED; // Return a zeroed buffer on error
             } else {
                 printf("Received %d bytes from target.\n", transferred);
-                printf("Raw Payload: [0x%02X, 0x%02X, 0x%02X, 0x%02X]\n", 
-                        rx_buffer[1], rx_buffer[2], rx_buffer[3], rx_buffer[4]);
+                printf("Raw Payload: [");
+                for (int i = 0; i < REPORT_SIZE; i++) {
+                    printf("0x%02X%s", rx_buff[i],
+                        (i < REPORT_SIZE - 1) ? ", " : "");
+                }
+                printf("]\n");
             }
-            
+
+            return ERROR_NONE; // Return success code
+}
+
+
+MCU_commands get_command_from_rx_buffer(unsigned char* rx_buff){
+    return rx_buff[1]; // Return the command byte from the received buffer
+}
+
+
+i_src_param* get_param(i_src_param* param, libusb_device_handle **USB_Device) {
+            unsigned char tx_buffer[REPORT_SIZE];
+            unsigned char rx_buffer[REPORT_SIZE];
+            transmit_data(tx_buffer, rx_buffer, CMD_GET_PARAMETERS, USB_Device);
             param->adc_raw = read_uint32_from_buff(&rx_buffer[2]);
             param->voltage = read_uint32_from_buff(&rx_buffer[6]);
             param->voltage_corrected = read_uint32_from_buff(&rx_buffer[10]);
@@ -125,73 +189,30 @@ i_src_param* get_param(i_src_param* param, libusb_device_handle **USB_Device) {
             param->i_lim = read_uint32_from_buff(&rx_buffer[18]);
             param->i = read_uint32_from_buff(&rx_buffer[22]);
             param->Vdac = read_uint32_from_buff(&rx_buffer[26]);
-            param->voltage_correction = read_uint32_from_buff(&rx_buffer[30]);
+            param->measuring_time = read_uint32_from_buff(&rx_buffer[30]);
+            param->voltage_correction = read_uint32_from_buff(&rx_buffer[34]);
+
     return param;
 }
 
-i_src_param* set_current(i_src_param* param, libusb_device_handle **USB_Device) {
-            int result;
-            int transferred = 0;
-            if (!(*USB_Device)) {
-                fprintf(stderr, "Error: No device connected. Connect a device first.\n");
-                return NULL;
-            }
-
-            memset(rx_buffer, 0, REPORT_SIZE);
-            transferred = 0;
-
-            memset(tx_buffer, 0, REPORT_SIZE);
-            tx_buffer[0] = REPORT_ID_OUT; 
-            tx_buffer[1] = CMD_SET_CURRENT; 
+error_codes_t set_current(i_src_param* param, libusb_device_handle **USB_Device) {
+            unsigned char tx_buffer[REPORT_SIZE];
+            unsigned char rx_buffer[REPORT_SIZE];
             write_uint32_to_buff(&tx_buffer[2], (uint32_t)param->i); // Assuming param->i is the current value to set
+            transmit_data(tx_buffer, rx_buffer, CMD_SET_CURRENT, USB_Device);
             printf("Setting current...\n");
-            result = libusb_interrupt_transfer(*USB_Device, EP_OUT, tx_buffer, REPORT_SIZE, &transferred, 1000);
-            
-            if (result < 0) {
-                fprintf(stderr, "Error: Data transmission failed (%d)\n", result);
-                return NULL;
-            } else {
-                printf("Sent %d bytes successfully.\n", transferred);
-            }
-
-            result = libusb_interrupt_transfer(*USB_Device, EP_IN, rx_buffer, REPORT_SIZE, &transferred, 3000);
-            
-            if (result < 0) {
-                fprintf(stderr, "Error: Data reception failed (%d)\n", result);
-                return NULL;
-            } else {
-                printf("Received %d bytes from target.\n", transferred);
-                printf("Raw Payload: [0x%02X, 0x%02X, 0x%02X, 0x%02X]\n", 
-                        rx_buffer[1], rx_buffer[2], rx_buffer[3], rx_buffer[4]);
-            }
-            
             param->i = read_uint32_from_buff(&rx_buffer[2]);
             printf("Current data: %d mA\n", param->i);// Added brackets to isolate local variables inside case block
-    return param;
+    return ERROR_NONE; // Return success code
 }
 
 
-void help() {
-        printf("%*s\n", width_begin, "Available commands:");
-        printf("%*d - Help\n", width_end, CMD_HELP);
-        printf("%*d - Connect device\n", width_end, CMD_CONNECT_DEVICE);
-        printf("%*d - Connect default device\n", width_end, CMD_DEFAULT_DEVICE);
-        printf("%*d - Debug mode\n", width_end, CMD_DEBUG);
-        printf("%*d - Exit debug mode\n", width_end, CMD_EXIT_DEBUG);
-        printf("%*d - Get current\n", width_end, CMD_GET_CURRENT);
-        printf("%*d - Set current\n", width_end, CMD_SET_CURRENT);
-        printf("%*d - Get parameters\n", width_end, CMD_GET_PARAMETERS);
-        printf("%*d - Get graph\n", width_end, CMD_GET_GRAPH);
-        printf("%*d - Set measuring time\n", width_end, CMD_SET_TIME_MEASURING);
-        printf("%*d - Set voltage correction\n", width_end, CMD_SET_VOLTAGE_CORRECTION);
-        printf("%*d - Exit program\n", width_end, CMD_EXIT);
-}
 
-int32_t connect_device(libusb_context *ctx, libusb_device_handle **USB_Device, unsigned int VID, unsigned int PID) {
+error_codes_t connect_device(libusb_context *ctx, libusb_device_handle **USB_Device, unsigned int VID, unsigned int PID) {
     *USB_Device = libusb_open_device_with_vid_pid(ctx, VID, PID);
     if (!(*USB_Device)) {
         fprintf(stderr, "Error: Device VID 0x%04X PID 0x%04X not found.\n", VID, PID);
-        return -1;
+        return ERROR_CURRENT_DRIVER_NOT_CONNECTED;
     }
     printf("Device opened successfully.\n");
     
@@ -200,13 +221,13 @@ int32_t connect_device(libusb_context *ctx, libusb_device_handle **USB_Device, u
         fprintf(stderr, "Error: Cannot claim interface %d (%d)\n", INT_INTERFACE, result);
         libusb_close(*USB_Device);
         *USB_Device = NULL;
-        return -1;
+        return ERROR_CURRENT_DRIVER_TRANSFER_FAILED;
     }
     printf("Interface %d claimed successfully.\n", INT_INTERFACE);
-    return 0;
+    return ERROR_NONE;
 }
 
-int32_t get_graph(libusb_device_handle **USB_Device, i_src_param* graph_param, i_src_param* param) {
+error_codes_t get_graph(libusb_device_handle **USB_Device, i_src_param* graph_param, i_src_param* param) {
         int steps;
         int min_current;
         int max_current;
@@ -214,23 +235,23 @@ int32_t get_graph(libusb_device_handle **USB_Device, i_src_param* graph_param, i
         i_src_param* result_param;
         if (!(*USB_Device)) {
             fprintf(stderr, "Error: No device connected. Connect a device first.\n");
-            return -1;
+            return ERROR_CURRENT_DRIVER_NOT_CONNECTED;
         }
         printf("%*s write minimal current (in mA): ", width_begin, "");
-        if (scanf("%u", &tmp) != 1) return -1; // Read as hex
+        if (scanf("%u", &tmp) != 1) return ERROR_CURRENT_DRIVER_INVALID_PARAMETER; // Read as hex
         min_current = tmp;
         printf("%*s write maximum current (in mA): ", width_begin, "");
-        if (scanf("%u", &tmp) != 1) return -1; // Read as hex
+        if (scanf("%u", &tmp) != 1) return ERROR_CURRENT_DRIVER_INVALID_PARAMETER; // Read as hex
         max_current = tmp;
         printf("%*s write number of steps: ", width_begin, "");
-        if (scanf("%u", &tmp) != 1) return -1; // Read as hex
+        if (scanf("%u", &tmp) != 1) return ERROR_CURRENT_DRIVER_INVALID_PARAMETER; // Read as hex
         steps = tmp;
         amount_of_data = steps + 1; // Including both min and max
 
         graph_param = calloc(amount_of_data, sizeof(i_src_param));
         if (!graph_param) {
             fprintf(stderr, "Error: Memory allocation failed for graph_param.\n");
-            return -1;
+            return ERROR_CURRENT_DRIVER_TRANSFER_FAILED;
         }
 
         printf("Getting graph data...\n");
@@ -243,7 +264,7 @@ int32_t get_graph(libusb_device_handle **USB_Device, i_src_param* graph_param, i
                 fprintf(stderr, "Error: Failed to retrieve graph data at step %d.\n", i);
                 free(graph_param);
                 graph_param = NULL;
-                return -1;
+                return ERROR_CURRENT_DRIVER_TRANSFER_FAILED;
             }
         }
         printf("Graph data retrieved successfully.\n");
@@ -255,147 +276,156 @@ int32_t get_graph(libusb_device_handle **USB_Device, i_src_param* graph_param, i
             graph_param = NULL;
         }
     
-    return 0;
+    return ERROR_NONE;
 }
 
-int32_t transmit_unar_op( libusb_device_handle **USB_Device, unsigned char command) {
-        int result;
-        int transferred = 0;
-        if (!(*USB_Device)) {
-            fprintf(stderr, "Error: No device connected. Connect a device first.\n");
-            return -1;
-        }
-        memset(tx_buffer, 0, REPORT_SIZE);
+error_codes_t transmit_unar_op( libusb_device_handle **USB_Device, MCU_commands cmd,unsigned char* rx_buffer) {
+        unsigned char tx_buffer[REPORT_SIZE];
         tx_buffer[0] = REPORT_ID_OUT; 
-        tx_buffer[1] = command;
-        memset(rx_buffer, 0, REPORT_SIZE);
-        transferred = 0;
-
-        printf("Activating debug mode...\n");
-        result = libusb_interrupt_transfer(*USB_Device, EP_OUT, tx_buffer, REPORT_SIZE, &transferred, 1000);
-        
-        if (result < 0) {
-            fprintf(stderr, "Error: Data transmission failed (%d)\n", result);
-            return -1;
-        } else {
-            printf("Sent %d bytes successfully.\n", transferred);
-        }
-
-        printf("%*s\n", width_begin, "Debug mode activated.");
-        return 0;
+        tx_buffer[1] = cmd;
+        return  transmit_data(tx_buffer, rx_buffer, cmd, USB_Device);
 }
 
-int32_t set_measuring_time(libusb_device_handle **USB_Device, unsigned int time_ms) {
-        int result;
-        int confirmed_time;
-        int transferred = 0;
-        if (!(*USB_Device)) {
-            fprintf(stderr, "Error: No device connected. Connect a device first.\n");
-            return -1;
-        }
-        memset(tx_buffer, 0, REPORT_SIZE);
-        tx_buffer[0] = REPORT_ID_OUT; 
-        tx_buffer[1] = CMD_SET_TIME_MEASURING; 
+error_codes_t set_measuring_time(libusb_device_handle **USB_Device, i_src_param* param, unsigned int time_ms, unsigned char* rx_buffer) {
+        error_codes_t result;
+        unsigned char tx_buffer[REPORT_SIZE];
         write_uint32_to_buff(&tx_buffer[2], time_ms); // Assuming time_ms is the measuring time to set
-        memset(rx_buffer, 0, REPORT_SIZE);
-        transferred = 0;
-
         printf("Setting measuring time...\n");
-        result = libusb_interrupt_transfer(*USB_Device, EP_OUT, tx_buffer, REPORT_SIZE, &transferred, 1000);
-        
-        if (result < 0) {
-            fprintf(stderr, "Error: Data transmission failed (%d)\n", result);
-            return -1;
-        } else {
-            printf("Sent %d bytes successfully.\n", transferred);
-        }
-
-        result = libusb_interrupt_transfer(*USB_Device, EP_IN, rx_buffer, REPORT_SIZE, &transferred, 3000);
-        
-        if (result < 0) {
-            fprintf(stderr, "Error: Data reception failed (%d)\n", result);
-            return -1;
-        } else {
-            printf("Received %d bytes from target.\n", transferred);
-            printf("Raw Payload: [0x%02X, 0x%02X, 0x%02X, 0x%02X]\n", 
-                    rx_buffer[1], rx_buffer[2], rx_buffer[3], rx_buffer[4]);
-        }
-        
-        confirmed_time = read_uint32_from_buff(&rx_buffer[30]);
+        result = transmit_data(tx_buffer, rx_buffer, CMD_SET_TIME_MEASURING, USB_Device);
+        uint32_t confirmed_time = read_uint32_from_buff(&rx_buffer[30]);
+        param->measuring_time = confirmed_time; // Update the measuring time in the param structure
         printf("Measuring time: %d ms\n", confirmed_time);
-    return confirmed_time;
+        if (result != ERROR_NONE) {
+            printf("FAIL\n");
+            return result;
+        }
+    return ERROR_NONE; // Return the command byte from the received buffer
 }
 
-int32_t set_voltage_correction(libusb_device_handle **USB_Device, unsigned int voltage_correction) {
-        int result;
-        int confirmed_voltage_correction;
-        int transferred = 0;
-        if (!(*USB_Device)) {
-            fprintf(stderr, "Error: No device connected. Connect a device first.\n");
-            return -1;
-        }
-        memset(tx_buffer, 0, REPORT_SIZE);
-        tx_buffer[0] = REPORT_ID_OUT; 
-        tx_buffer[1] = CMD_SET_VOLTAGE_CORRECTION; 
-        write_uint32_to_buff(&tx_buffer[2], voltage_correction);
-        memset(rx_buffer, 0, REPORT_SIZE);
-        transferred = 0;
+// int32_t set_voltage_correction(libusb_device_handle **USB_Device, unsigned int voltage_correction) {
+//         int result;
+//         int confirmed_voltage_correction;
+//         int transferred = 0;
+//         if (!(*USB_Device)) {
+//             fprintf(stderr, "Error: No device connected. Connect a device first.\n");
+//             return -1;
+//         }
+//         memset(tx_buffer, 0, REPORT_SIZE);
+//         tx_buffer[0] = REPORT_ID_OUT; 
+//         tx_buffer[1] = CMD_SET_VOLTAGE_CORRECTION; 
+//         write_uint32_to_buff(&tx_buffer[2], voltage_correction);
+//         memset(rx_buffer, 0, REPORT_SIZE);
+//         transferred = 0;
 
-        printf("Setting voltage correction...\n");
-        result = libusb_interrupt_transfer(*USB_Device, EP_OUT, tx_buffer, REPORT_SIZE, &transferred, 1000);
+//         printf("Setting voltage correction...\n");
+//         result = libusb_interrupt_transfer(*USB_Device, EP_OUT, tx_buffer, REPORT_SIZE, &transferred, 1000);
         
-        if (result < 0) {
-            fprintf(stderr, "Error: Data transmission failed (%d)\n", result);
-            return -1;
-        } else {
-            printf("Sent %d bytes successfully.\n", transferred);
-        }
+//         if (result < 0) {
+//             fprintf(stderr, "Error: Data transmission failed (%d)\n", result);
+//             return -1;
+//         } else {
+//             printf("Sent %d bytes successfully.\n", transferred);
+//         }
 
-        result = libusb_interrupt_transfer(*USB_Device, EP_IN, rx_buffer, REPORT_SIZE, &transferred, 3000);
+//         result = libusb_interrupt_transfer(*USB_Device, EP_IN, rx_buffer, REPORT_SIZE, &transferred, 3000);
         
-        if (result < 0) {
-            fprintf(stderr, "Error: Data reception failed (%d)\n", result);
-            return -1;
-        } else {
-            printf("Received %d bytes from target.\n", transferred);
-            printf("Raw Payload: [0x%02X, 0x%02X, 0x%02X, 0x%02X]\n", 
-                    rx_buffer[1], rx_buffer[2], rx_buffer[3], rx_buffer[4]);
-        }
+//         if (result < 0) {
+//             fprintf(stderr, "Error: Data reception failed (%d)\n", result);
+//             return -1;
+//         } else {
+//             printf("Received %d bytes from target.\n", transferred);
+//             printf("Raw Payload: [0x%02X, 0x%02X, 0x%02X, 0x%02X]\n", 
+//                     rx_buffer[1], rx_buffer[2], rx_buffer[3], rx_buffer[4]);
+//         }
         
-        confirmed_voltage_correction = read_uint32_from_buff(&rx_buffer[34]);
-        printf("Voltage correction: %d mV\n", confirmed_voltage_correction);
-    return confirmed_voltage_correction;
+//         confirmed_voltage_correction = read_uint32_from_buff(&rx_buffer[34]);
+//         printf("Voltage correction: %d mV\n", confirmed_voltage_correction);
+//     return confirmed_voltage_correction;
+// }
+
+
+error_codes_t get_current(libusb_device_handle **USB_Device, i_src_param* param) {
+    error_codes_t result;
+    unsigned char rx_buffer[REPORT_SIZE];
+    memset(rx_buffer, 0, REPORT_SIZE);
+    result = transmit_unar_op(USB_Device, CMD_GET_PARAMETERS, rx_buffer);
+    if (result != ERROR_NONE) {
+        return result;
+    }
+    param->i = read_uint32_from_buff(&rx_buffer[42]);
+    printf("Current data: %d mA\n", param->i);
+    return ERROR_NONE;
 }
 
-
-int32_t get_current(libusb_device_handle **USB_Device, i_src_param* param) {
-        int result;
-        int transferred = 0;
-        transmit_unar_op(USB_Device, CMD_GET_CURRENT);
-
-            result = libusb_interrupt_transfer(*USB_Device, EP_IN, rx_buffer, REPORT_SIZE, &transferred, 3000);
+error_codes_t CurrentSource_init(i_src_param* param, libusb_device_handle **USB_Device) {
+            unsigned char rx_buffer[REPORT_SIZE];
+            unsigned char tx_buffer[REPORT_SIZE];
+            uint32_t tmp;
+            error_codes_t result = ERROR_NONE;
             
-            if (result < 0) {
-                fprintf(stderr, "Error: Data reception failed (%d)\n", result);
-            } else {
-                printf("Received %d bytes from target.\n", transferred);
-                printf("Raw Payload: [0x%02X, 0x%02X, 0x%02X, 0x%02X]\n", 
-                        rx_buffer[1], rx_buffer[2], rx_buffer[3], rx_buffer[4]);
+            printf("Setting time...\n");
+            printf("%*s write measuring time (in ms): ", width_begin, "");
+            if (scanf("%u", &tmp) != 1) return ERROR_CURRENT_DRIVER_INVALID_PARAMETER; // Read as hex
+            result = set_measuring_time(USB_Device, param, tmp, rx_buffer);
+            while(get_command_from_rx_buffer(rx_buffer) == CMD_RETRY || param->measuring_time == 0) {
+                printf("Retrying to set measuring time...\n");
+                printf("%*s write measuring time (in ms): ", width_begin, "");
+                if (scanf("%u", &tmp) != 1) return ERROR_CURRENT_DRIVER_INVALID_PARAMETER; // Read as hex
+                result = set_measuring_time(USB_Device, param, tmp, rx_buffer);
+                if(result != ERROR_NONE){
+                    return result;
+                }
             }
-            
-            param->i = read_uint32_from_buff(&rx_buffer[2]);
-            printf("Current data: %d mA\n", param->i);
-    return 0;
+            if(result == ERROR_CURRENT_DRIVER_NOT_CONNECTED){
+                return ERROR_CURRENT_DRIVER_NOT_CONNECTED;
+            }
+            printf("Setting control mode...\n");
+            printf("%*s\n", width_begin, "Available modes:");
+            printf("%*d - Simple\n", width_end, SIMPLE);
+            printf("%*d - PI\n", width_end, PI);
+            printf("%*d - PID\n", width_end, PID);
+            if (scanf("%u", &tmp) != 1) return ERROR_CURRENT_DRIVER_INVALID_PARAMETER; // Read as hex
+            param->mode = tmp;
+            tx_buffer[2] = param->mode;
+            result = transmit_data(tx_buffer, rx_buffer, CMD_SET_CONTROL_MODE, USB_Device);
+            while(get_command_from_rx_buffer(rx_buffer) == CMD_RETRY) {
+                printf("Retrying to set control mode? invalid value...\n");
+                printf("Setting control mode...\n");
+                printf("%*s\n", width_begin, "Available modes:");
+                printf("%*d - Simple\n", width_end, SIMPLE);
+                printf("%*d - PI\n", width_end, PI);
+                printf("%*d - PID\n", width_end, PID);
+                if (scanf("%u", &tmp) != 1) return ERROR_CURRENT_DRIVER_INVALID_PARAMETER; // Read as hex
+                param->mode = tmp;
+                tx_buffer[2] = param->mode;
+                result = transmit_data(tx_buffer, rx_buffer, CMD_SET_CONTROL_MODE, USB_Device);
+            }
+
+            printf("Setting current value...\n");
+            printf("%*s write current (in mA): ", width_begin, "");
+            if (scanf("%u", &tmp) != 1) return ERROR_CURRENT_DRIVER_INVALID_PARAMETER; // Read as hex
+            param->i = tmp;
+            result = transmit_data(tx_buffer, rx_buffer, CMD_SET_CURRENT, USB_Device);
+            while(get_command_from_rx_buffer(rx_buffer) == CMD_RETRY || param->i == 0) {
+                printf("Retrying to set current...\n");
+                printf("%*s write current (in mA): ", width_begin, "");
+                if (scanf("%u", &tmp) != 1) return ERROR_CURRENT_DRIVER_INVALID_PARAMETER; // Read as hex
+                param->i = tmp;
+                result = transmit_data(tx_buffer, rx_buffer, CMD_SET_CURRENT, USB_Device);
+            }
+
+            printf("INITIALIZED\n");// Added brackets to isolate local variables inside case block
+    return result; // Return the result of the last operation
 }
-
-
 
 // Now accepts pointers to persist the device state across calls
 void command_interface(commands cmd, libusb_context *ctx, libusb_device_handle **USB_Device)
 {
+    unsigned char tx_buffer[REPORT_SIZE];
+    unsigned char rx_buffer[REPORT_SIZE];
     unsigned int VID; // Изменено на unsigned int
     unsigned int PID; // Изменено на unsigned int
-    i_src_param param ={0, 0, 0, 0, 0, 0, 0, 0}; // Initialize all fields to zero
+    i_src_param param ={0, 0, 0, 0, 0, 0, 0, 0, 0, 0}; // Initialize all fields to zero
     i_src_param* graph_param = calloc(100, sizeof(i_src_param));
     if (!graph_param) { 
         fprintf(stderr, "Error: Memory allocation failed for graph_param.\n");
@@ -403,16 +433,16 @@ void command_interface(commands cmd, libusb_context *ctx, libusb_device_handle *
     }
 
     switch (cmd){
-        case CMD_HELP:
+        case CMD_HELP_CONSOLE:
             help();
             break;
-        case CMD_DEFAULT_DEVICE:
+        case CMD_DEFAULT_DEVICE_CONSOLE:
             VID = DEVICE_VID;
             PID = DEVICE_PID;
             connect_device(ctx, USB_Device, VID, PID);
             break; 
 
-        case CMD_CONNECT_DEVICE:
+        case CMD_CONNECT_DEVICE_CONSOLE:
             printf("%*s write DEVICE_VID (in Hex, e.g. 1155 for 0x0483): ", width_begin, "");
             if (scanf("%x", &tmp) != 1) return; // Read as hex
             VID = tmp;
@@ -424,39 +454,52 @@ void command_interface(commands cmd, libusb_context *ctx, libusb_device_handle *
             connect_device(ctx, USB_Device, VID, PID);
             printf("Interface %d claimed successfully.\n", INT_INTERFACE);
             break;
-        case CMD_GET_CURRENT:
+        case CMD_INIT_CONSOLE:
+            CurrentSource_init(&param, USB_Device);
+            break;
+        case CMD_GET_CURRENT_CONSOLE:
             get_current(USB_Device, &param);
             break;
-        case CMD_SET_CURRENT:
+        case CMD_SET_CURRENT_CONSOLE:
             printf("%*s write current (in mA): ", width_begin, "");
             if (scanf("%u", &tmp) != 1) return; // Read as hex
             param.i = tmp;
-            set_current(&param, USB_Device);
+            transmit_data(tx_buffer, rx_buffer, CMD_SET_CURRENT, USB_Device);
+            while(get_command_from_rx_buffer(rx_buffer) == CMD_RETRY) {
+                printf("Retrying to set current...\n");
+            }
             break;
-        case CMD_GET_PARAMETERS:
+        case CMD_GET_PARAMETERS_CONSOLE:
             get_param(&param, USB_Device);
             print_data(&param);
             break;
-        case CMD_SET_TIME_MEASURING:
+        case CMD_SET_TIME_MEASURING_CONSOLE:
             printf("%*s write measuring time (in ms): ", width_begin, "");
             if (scanf("%u", &tmp) != 1) return; // Read as hex
-            set_measuring_time(USB_Device, tmp);
+            set_measuring_time(USB_Device, &param, tmp, rx_buffer);
+            while(get_command_from_rx_buffer(rx_buffer) == CMD_RETRY) {
+                printf("Retrying to set measuring time...\n");
+                if (scanf("%u", &tmp) != 1) return; // Read as hex
+                set_measuring_time(USB_Device, &param, tmp, rx_buffer);
+            }
             break;
-        case CMD_SET_VOLTAGE_CORRECTION:
-            printf("%*s write voltage correction (in mV): ", width_begin, "");
-            if (scanf("%u", &tmp) != 1) return; // Read as hex
-            set_voltage_correction(USB_Device, tmp);
-            break;
-        case CMD_GET_GRAPH:
+        // case CMD_SET_VOLTAGE_CORRECTION:
+        //     printf("%*s write voltage correction (in mV): ", width_begin, "");
+        //     if (scanf("%u", &tmp) != 1) return; // Read as hex
+        //     while(get_command_from_rx_buffer(rx_buffer) == CMD_RETRY) {
+        //         printf("Retrying to set voltage correction...\n");
+        //     }
+        //     break;
+        case CMD_GET_GRAPH_CONSOLE:
             get_graph(USB_Device, graph_param, &param);
             break;
-        case CMD_DEBUG:
-            transmit_unar_op(USB_Device, CMD_DEBUG);
+        case CMD_DEBUG_CONSOLE:
+            transmit_unar_op(USB_Device, CMD_DEBUG, rx_buffer);
             break;
-        case CMD_EXIT_DEBUG:
-            transmit_unar_op(USB_Device, CMD_EXIT_DEBUG);
+        case CMD_EXIT_DEBUG_CONSOLE:
+            transmit_unar_op(USB_Device, CMD_EXIT_DEBUG, rx_buffer);
             break;
-        case CMD_EXIT:
+        case CMD_EXIT_CONSOLE:
             printf("%*s\n", width_begin, "Exiting program...");
             break;
         default:
@@ -490,7 +533,7 @@ int main(int argc, char **argv)
         {
             printf("----------------------Start Menu------------------------\n");
             start_flag = false;
-            command_interface(CMD_HELP, ctx, &USB_Device); // Removed ghost variables
+            command_interface(CMD_HELP_CONSOLE, ctx, &USB_Device); // Removed ghost variables
         }
         
         printf("\nEnter command number: ");
@@ -501,12 +544,12 @@ int main(int argc, char **argv)
             continue;
         }
         
-        if (cmd < CMD_HELP || cmd > CMD_EXIT) // Replaced unknown CMD_LOAD_READY with CMD_EXIT
+        if (cmd < CMD_HELP_CONSOLE || cmd > CMD_EXIT_CONSOLE) // Replaced unknown CMD_LOAD_READY with CMD_EXIT_CONSOLE
         {
             printf("Unknown command - try command help\n");
             continue;
         } 
-        else if (cmd == CMD_EXIT)
+        else if (cmd == CMD_EXIT_CONSOLE)
         {
             exit_flag = 1;
             printf("Exiting program...\n");
